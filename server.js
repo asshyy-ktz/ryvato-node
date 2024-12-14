@@ -9,6 +9,8 @@ const app = express();
 // Middleware
 app.use(bodyParser.json());
 
+require("./startup/db")();
+
 // Routes
 app.use("/api/auth", authRoutes);
 

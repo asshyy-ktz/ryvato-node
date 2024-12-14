@@ -1,43 +1,25 @@
 const jwt = require("jsonwebtoken");
 const nodemailer = require("nodemailer");
 const User = require("../models/User");
-const { promisify } = require("util");
+const { generateOTP } = require("../utils/otpUtils");
 
 // Send Magic Link
-const sendMagicLink = async (req, res) => {
-  const { email } = req.body;
+const sendOTPEmail = async (email, otp) => {
+  const transporter = nodemailer.createTransport({
+    service: "Gmail",
+    auth: {
+      user: process.env.EMAIL_USER,
+      pass: process.env.EMAIL_PASS,
+    },
+  });
 
-  if (!email) return res.status(400).json({ message: "Email is required" });
-
-  try {
-    // Generate a JWT token
-    const token = jwt.sign({ email }, process.env.JWT_SECRET, {
-      expiresIn: "15m",
-    });
-
-    // Send email
-    const transporter = nodemailer.createTransport({
-      service: "Gmail",
-      auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS,
-      },
-    });
-
-    const magicLink = `${process.env.CLIENT_URL}/auth/verify?token=${token}`;
-
-    await transporter.sendMail({
-      from: process.env.EMAIL_USER,
-      to: email,
-      subject: "Your Magic Link",
-      html: `<p>Click the link below to log in:</p><a href="${magicLink}">${magicLink}</a>`,
-    });
-
-    res.status(200).json({ message: "Magic link sent to email" });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: "Error sending magic link" });
-  }
+  await transporter.sendMail({
+    from: process.env.EMAIL_USER,
+    to: email,
+    subject: "Your Email Verification OTP",
+    html: `<p>Your OTP for email verification is: <strong>${otp}</strong></p>
+           <p>This OTP will expire in 15 minutes.</p>`,
+  });
 };
 
 // Verify Magic Link
@@ -74,18 +56,44 @@ const signToken = (id) => {
 
 const signup = async (req, res) => {
   try {
+    // 1. Validate request body
+    const { userEmail, userFullname, password, confirmPassword, isIndividual } =
+      req.body;
+
+    if (password !== confirmPassword) {
+      return res.status(400).json({
+        status: "fail",
+        message: "Passwords do not match",
+      });
+    }
+
+    // 2. Generate OTP
+    const otp = generateOTP();
+    const otpExpiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+
+    // 3. Create user
     const newUser = await User.create({
-      userFullname: req.body.userFullname,
-      userEmail: req.body.userEmail,
-      password: req.body.password,
-      isIndividual: req.body.isIndividual,
-      companyId: req.body.companyId,
+      userEmail,
+      userFullname,
+      password,
+      isIndividual: isIndividual ?? true,
+      otp: {
+        code: otp,
+        expiresAt: otpExpiresAt,
+      },
     });
 
-    const token = signToken(newUser._id);
+    // 4. Send OTP email
+    await sendOTPEmail(userEmail, otp);
+
+    // 5. Generate JWT token
+    const token = jwt.sign({ id: newUser._id }, process.env.JWT_SECRET, {
+      expiresIn: process.env.JWT_EXPIRES_IN,
+    });
 
     res.status(201).json({
       status: "success",
+      message: "OTP sent to your email for verification.",
       token,
       data: {
         user: {
@@ -93,8 +101,100 @@ const signup = async (req, res) => {
           userFullname: newUser.userFullname,
           userEmail: newUser.userEmail,
           isIndividual: newUser.isIndividual,
+          isVerified: false,
         },
       },
+    });
+  } catch (err) {
+    res.status(400).json({
+      status: "fail",
+      message: err.message,
+    });
+  }
+};
+
+const verifyOTP = async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+
+    const user = await User.findOne({ userEmail: email });
+
+    if (!user) {
+      return res.status(404).json({
+        status: "fail",
+        message: "User not found",
+      });
+    }
+
+    // Check if OTP exists and hasn't expired
+    if (
+      !user.otp ||
+      !user.otp.code ||
+      !user.otp.expiresAt ||
+      new Date() > user.otp.expiresAt
+    ) {
+      return res.status(400).json({
+        status: "fail",
+        message: "OTP has expired. Please request a new one.",
+      });
+    }
+
+    // Verify OTP
+    if (user.otp.code !== otp) {
+      return res.status(400).json({
+        status: "fail",
+        message: "Invalid OTP",
+      });
+    }
+
+    // Update user status
+    user.isVerified = true;
+    user.userStatus = 1; // active
+    user.otp = undefined; // Clear OTP after successful verification
+    await user.save();
+
+    res.status(200).json({
+      status: "success",
+      message: "Email verified successfully",
+    });
+  } catch (err) {
+    res.status(400).json({
+      status: "fail",
+      message: err.message,
+    });
+  }
+};
+
+const resendOTP = async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    const user = await User.findOne({ userEmail: email });
+
+    if (!user) {
+      return res.status(404).json({
+        status: "fail",
+        message: "User not found",
+      });
+    }
+
+    // Generate new OTP
+    const otp = generateOTP();
+    const otpExpiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+
+    // Update user's OTP
+    user.otp = {
+      code: otp,
+      expiresAt: otpExpiresAt,
+    };
+    await user.save();
+
+    // Send new OTP email
+    await sendOTPEmail(email, otp);
+
+    res.status(200).json({
+      status: "success",
+      message: "New OTP sent to your email",
     });
   } catch (err) {
     res.status(400).json({
@@ -183,9 +283,10 @@ const forgotPassword = async (req, res) => {
 };
 
 module.exports = {
-  sendMagicLink,
   verifyMagicLink,
   signup,
   login,
   forgotPassword,
+  verifyOTP,
+  resendOTP,
 };
